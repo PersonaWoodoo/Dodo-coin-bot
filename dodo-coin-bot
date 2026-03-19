@@ -1,0 +1,1912 @@
+import telebot
+from telebot import types
+import json
+import os
+import random
+from datetime import datetime, timedelta
+import time
+import threading
+import re
+
+# =========== НАСТРОЙКИ ===========
+TOKEN = '8669559597:AAGh9Q5z4-WvUNU317OWUpF5cTXAtggkoRI'  # Новый токен
+ADMIN_ID = 8478884644  # ⚠️ ЗАМЕНИТЕ НА ВАШ TELEGRAM ID
+INITIAL_BALANCE = 2000
+
+# Обязательные подписки (ОТКЛЮЧЕНЫ)
+REQUIRED_CHANNEL = None  # @DodoCoin_news
+REQUIRED_CHAT = None     # @dodoCoin_chat
+# =================================
+
+bot = telebot.TeleBot(TOKEN)
+
+# Удаляем вебхук, чтобы избежать ошибки 409
+bot.delete_webhook()
+
+# Файлы для хранения данных
+DATA_FILE = 'dodo_data.json'
+PROMO_FILE = 'promocodes.json'
+BANNED_FILE = 'banned_users.json'
+
+# Временный контекст для игр и ввода
+user_context = {}
+
+# Активные игры
+active_mines_games = {}
+active_crash_games = {}
+
+# =========== ЗАГРУЗКА/СОХРАНЕНИЕ ===========
+def load_data():
+    if os.path.exists(DATA_FILE):
+        with open(DATA_FILE, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            # Проверяем и добавляем недостающие поля для всех пользователей
+            for user_id, user_data in data.items():
+                if 'turnover' not in user_data:
+                    user_data['turnover'] = 0
+                if 'dmp' not in user_data:
+                    user_data['dmp'] = 0
+                if 'referrals' not in user_data:
+                    user_data['referrals'] = 0
+                if 'referral_bonus' not in user_data:
+                    user_data['referral_bonus'] = 0
+                if 'used_promos' not in user_data:
+                    user_data['used_promos'] = []
+            return data
+    return {}
+
+def save_data(data):
+    with open(DATA_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def load_promocodes():
+    if os.path.exists(PROMO_FILE):
+        with open(PROMO_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_promocodes(data):
+    with open(PROMO_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+def load_banned():
+    if os.path.exists(BANNED_FILE):
+        with open(BANNED_FILE, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    return {}
+
+def save_banned(data):
+    with open(BANNED_FILE, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=4, ensure_ascii=False)
+
+# =========== ПРОВЕРКА ПОДПИСОК (ВСЕГДА TRUE) ===========
+def check_subscription(user_id):
+    # Всегда возвращаем True, так как подписки отключены
+    return True
+
+def subscription_required(func):
+    def wrapper(message, *args, **kwargs):
+        # Пропускаем без проверки подписок
+        return func(message, *args, **kwargs)
+    return wrapper
+
+def is_banned(user_id):
+    banned = load_banned()
+    user_id = str(user_id)
+    if user_id in banned:
+        ban_info = banned[user_id]
+        if ban_info['until']:
+            ban_until = datetime.fromisoformat(ban_info['until'])
+            if datetime.now() < ban_until:
+                return True, ban_info
+            else:
+                del banned[user_id]
+                save_banned(banned)
+    return False, None
+
+def ban_required(func):
+    def wrapper(message, *args, **kwargs):
+        user_id = message.from_user.id
+        banned, ban_info = is_banned(user_id)
+        if banned:
+            ban_until = datetime.fromisoformat(ban_info['until'])
+            days_left = (ban_until - datetime.now()).days
+            reason = ban_info.get('reason', 'Не указана')
+            bot.send_message(
+                message.chat.id,
+                f"🚫 *Вы забанены!*\n\n"
+                f"📅 До: {ban_until.strftime('%d.%m.%Y %H:%M')}\n"
+                f"⏳ Осталось дней: {days_left}\n"
+                f"📝 Причина: {reason}",
+                parse_mode='Markdown'
+            )
+            return
+        return func(message, *args, **kwargs)
+    return wrapper
+
+# =========== ИНИЦИАЛИЗАЦИЯ ПОЛЬЗОВАТЕЛЯ ===========
+def init_user(user_id):
+    data = load_data()
+    user_id = str(user_id)
+    if user_id not in data:
+        data[user_id] = {
+            'balance': INITIAL_BALANCE,
+            'last_bonus': None,
+            'last_robbery': None,
+            'lost_total': 0,
+            'games_played': 0,
+            'games_won': 0,
+            'username': None,
+            'first_name': None,
+            'referrals': 0,
+            'referral_bonus': 0,
+            'used_promos': [],
+            'turnover': 0,      # Оборот
+            'dmp': 0           # DODO POINT
+        }
+        save_data(data)
+    else:
+        # Проверяем наличие всех полей у существующего пользователя
+        user_data = data[user_id]
+        updated = False
+        if 'turnover' not in user_data:
+            user_data['turnover'] = 0
+            updated = True
+        if 'dmp' not in user_data:
+            user_data['dmp'] = 0
+            updated = True
+        if 'referrals' not in user_data:
+            user_data['referrals'] = 0
+            updated = True
+        if 'referral_bonus' not in user_data:
+            user_data['referral_bonus'] = 0
+            updated = True
+        if 'used_promos' not in user_data:
+            user_data['used_promos'] = []
+            updated = True
+        if updated:
+            save_data(data)
+    
+    return data[user_id]
+
+def update_user_info(user_id, message):
+    data = load_data()
+    user_id = str(user_id)
+    if user_id in data:
+        data[user_id]['username'] = message.from_user.username
+        data[user_id]['first_name'] = message.from_user.first_name
+        save_data(data)
+
+def get_user_context(user_id):
+    if user_id not in user_context:
+        user_context[user_id] = {}
+    return user_context[user_id]
+
+def add_to_admin(amount):
+    data = load_data()
+    admin_id = str(ADMIN_ID)
+    if admin_id not in data:
+        data[admin_id] = {
+            'balance': 0,
+            'last_bonus': None,
+            'last_robbery': None,
+            'lost_total': 0,
+            'games_played': 0,
+            'games_won': 0,
+            'username': 'Admin',
+            'first_name': 'Admin',
+            'turnover': 0,
+            'dmp': 0
+        }
+    data[admin_id]['balance'] += amount
+    save_data(data)
+
+def parse_amount(text):
+    text = str(text).lower().replace(' ', '').replace(',', '.')
+    if 'к' in text:
+        try:
+            number = float(text.replace('к', ''))
+            return int(number * 1000)
+        except:
+            return None
+    else:
+        try:
+            return int(float(text))
+        except:
+            return None
+
+def calculate_win_rate(user):
+    if user['games_played'] == 0:
+        return 0
+    return round((user['games_won'] / user['games_played']) * 100, 1)
+
+# =========== ИГРА MINES (×1.25 за клетку) ===========
+class MinesGame:
+    def __init__(self, user_id, bet, mines_count):
+        self.user_id = str(user_id)
+        self.bet = bet
+        self.mines_count = mines_count
+        self.grid_size = 6
+        self.grid = [['⬜' for _ in range(self.grid_size)] for _ in range(self.grid_size)]
+        self.mines_positions = set()
+        self.opened_cells = set()
+        self.multiplier = 1.0
+        self.game_active = True
+        self.won = False
+        self.generate_mines()
+    
+    def generate_mines(self):
+        all_cells = list(range(self.grid_size * self.grid_size))
+        self.mines_positions = set(random.sample(all_cells, self.mines_count))
+    
+    def open_cell(self, cell_index):
+        if cell_index in self.opened_cells or not self.game_active:
+            return None, None
+        
+        self.opened_cells.add(cell_index)
+        row = cell_index // self.grid_size
+        col = cell_index % self.grid_size
+        
+        if cell_index in self.mines_positions:
+            self.game_active = False
+            self.won = False
+            self.grid[row][col] = '💣'
+            return 'mine', 0.0
+        else:
+            self.multiplier *= 1.25
+            self.grid[row][col] = f'🟩{self.multiplier:.2f}x'
+            total_safe = self.grid_size * self.grid_size - self.mines_count
+            if len(self.opened_cells) == total_safe:
+                self.game_active = False
+                self.won = True
+                return 'win', self.multiplier
+            return 'safe', self.multiplier
+    
+    def cash_out(self):
+        if not self.game_active:
+            return 0
+        self.game_active = False
+        self.won = True
+        return int(self.bet * self.multiplier)
+    
+    def get_grid_display(self):
+        display = "🎮 *МИНЫ*\n"
+        display += "```\n"
+        for i in range(self.grid_size):
+            for j in range(self.grid_size):
+                cell = i * self.grid_size + j
+                if cell in self.opened_cells:
+                    if cell in self.mines_positions:
+                        display += "💣 "
+                    else:
+                        display += f"{self.multiplier:.2f}x".ljust(4) if cell == list(self.opened_cells)[-1] else "✅  "
+                else:
+                    display += f"[{cell+1:02d}] "
+            display += "\n"
+        display += "```\n"
+        display += f"💣 Мин: {self.mines_count}\n"
+        display += f"💰 Ставка: {self.bet} Dcoin\n"
+        display += f"📈 Текущий множитель: x{self.multiplier:.2f}\n"
+        display += f"💵 Текущий выигрыш: {int(self.bet * self.multiplier)} Dcoin"
+        return display
+
+# =========== СТАРТ / ГЛАВНОЕ МЕНЮ ===========
+@bot.message_handler(commands=['start'])
+@subscription_required
+@ban_required
+def start(message):
+    # Реферальная система
+    args = message.text.split()
+    if len(args) > 1:
+        referrer_id = args[1]
+        if referrer_id.isdigit() and int(referrer_id) != message.from_user.id:
+            referrer_id = str(referrer_id)
+            data = load_data()
+            if referrer_id in data:
+                data[referrer_id]['balance'] += 500
+                data[referrer_id]['referrals'] += 1
+                data[referrer_id]['referral_bonus'] += 500
+                user = init_user(message.from_user.id)
+                user['balance'] += 300
+                save_data(data)
+                bot.send_message(message.chat.id, "🎉 Вам начислен бонус за реферала!")
+
+    # Главное меню с кнопками
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=3)
+    markup.add('🎮 Игры', '👤 Профиль', '🎁 Бонус')
+    markup.add('💰 Ограбить', '💎 Промокод', '❓ Помощь')
+    markup.add('👥 Рефералы', '🏆 Топ игроков', '💸 Перевод')
+    markup.add('💣 Мины')  # Быстрый запуск Mines
+
+    user = init_user(message.from_user.id)
+    win_rate = calculate_win_rate(user)
+
+    bot.send_message(
+        message.chat.id,
+        f"🎉 *Добро пожаловать в Dodo Coin, {message.from_user.first_name}!*\n\n"
+        f"💰 Баланс: *{user['balance']} Dcoin*\n"
+        f"🎮 Игр: *{user['games_played']}*\n"
+        f"✅ Побед: *{user['games_won']}*\n"
+        f"📊 Win rate: *{win_rate}%*\n\n"
+        f"Выберите действие в меню ниже:",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+# =========== КОМАНДА /MINES И КНОПКА "💣 Мины" ===========
+@bot.message_handler(func=lambda message: message.text == '💣 Мины' or message.text.lower() == '/mines')
+@subscription_required
+@ban_required
+def start_mines(message):
+    bot.send_message(
+        message.chat.id,
+        "💣 *ИГРА МИНЫ*\n\n"
+        "💰 Введите ставку для игры:",
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(message, process_mines_bet)
+
+def process_mines_bet(message):
+    try:
+        bet = parse_amount(message.text)
+        if not bet or bet < 100:
+            bot.send_message(message.chat.id, "❌ Минимальная ставка: 100 Dcoin")
+            bot.register_next_step_handler(message, process_mines_bet)
+            return
+        
+        user = init_user(message.from_user.id)
+        if user['balance'] < bet:
+            bot.send_message(message.chat.id, "❌ Недостаточно средств")
+            return
+        
+        ctx = get_user_context(message.from_user.id)
+        ctx['mines_bet'] = bet
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ Ставка принята: {bet} Dcoin\n\n"
+            "💣 Введите количество мин (1-6):"
+        )
+        bot.register_next_step_handler(message, process_mines_count)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+def process_mines_count(message):
+    try:
+        mines = int(message.text.strip())
+        if mines < 1 or mines > 6:
+            bot.send_message(message.chat.id, "❌ Количество мин должно быть от 1 до 6!")
+            bot.register_next_step_handler(message, process_mines_count)
+            return
+        
+        user_id = message.from_user.id
+        ctx = get_user_context(user_id)
+        bet = ctx.get('mines_bet')
+        if not bet:
+            bot.send_message(message.chat.id, "❌ Ошибка ставки. Начните заново.")
+            return
+        
+        # Списываем баланс и учитываем оборот
+        user = init_user(user_id)
+        user['balance'] -= bet
+        user['turnover'] += bet
+        data = load_data()
+        data[str(user_id)] = user
+        save_data(data)
+        
+        game = MinesGame(user_id, bet, mines)
+        active_mines_games[str(user_id)] = game
+        
+        show_mines_field(message, game)
+    except ValueError:
+        bot.send_message(message.chat.id, "❌ Введите число от 1 до 6!")
+        bot.register_next_step_handler(message, process_mines_count)
+
+def show_mines_field(message, game):
+    markup = types.InlineKeyboardMarkup(row_width=6)
+    for i in range(6):
+        row = []
+        for j in range(6):
+            cell = i * 6 + j
+            if cell in game.opened_cells:
+                if cell in game.mines_positions:
+                    row.append(types.InlineKeyboardButton('💣', callback_data=f'mines_cell_{cell}'))
+                else:
+                    row.append(types.InlineKeyboardButton('✅', callback_data=f'mines_cell_{cell}'))
+            else:
+                row.append(types.InlineKeyboardButton(f'{cell+1:02d}', callback_data=f'mines_cell_{cell}'))
+        markup.row(*row)
+    
+    markup.row(
+        types.InlineKeyboardButton(f'💰 Забрать x{game.multiplier:.2f}', callback_data='mines_cashout'),
+        types.InlineKeyboardButton('❌ Выйти', callback_data='mines_cancel')
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        game.get_grid_display(),
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('mines_'))
+def mines_callback(call):
+    user_id = str(call.from_user.id)
+    if user_id not in active_mines_games:
+        bot.answer_callback_query(call.id, "❌ Игра не найдена!", show_alert=True)
+        return
+    
+    game = active_mines_games[user_id]
+    
+    if call.data == 'mines_cashout':
+        win = game.cash_out()
+        user = init_user(user_id)
+        user['balance'] += win
+        user['games_played'] += 1
+        user['games_won'] += 1
+        user['turnover'] += win
+        # Начисляем DMP за выигрыш > 10x
+        if win > game.bet * 10:
+            dmp_earned = int(win * 0.01)
+            user['dmp'] += dmp_earned
+            dmp_text = f"\n🎖️ DMP: +{dmp_earned}"
+        else:
+            dmp_text = ""
+        
+        data = load_data()
+        data[user_id] = user
+        save_data(data)
+        
+        bot.edit_message_text(
+            f"🎉 *ИГРА ЗАВЕРШЕНА!*\n\n"
+            f"💰 Выигрыш: *+{win} Dcoin*\n"
+            f"📈 Финальный множитель: x{game.multiplier:.2f}\n"
+            f"💵 Баланс: *{user['balance']} Dcoin*{dmp_text}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+        del active_mines_games[user_id]
+    
+    elif call.data == 'mines_cancel':
+        user = init_user(user_id)
+        user['balance'] += game.bet
+        data = load_data()
+        data[user_id] = user
+        save_data(data)
+        bot.edit_message_text(
+            f"❌ *ИГРА ОТМЕНЕНА*\n\n"
+            f"💰 Ставка возвращена: +{game.bet} Dcoin\n"
+            f"💵 Баланс: {user['balance']} Dcoin",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+        del active_mines_games[user_id]
+    
+    elif call.data.startswith('mines_cell_'):
+        cell = int(call.data.split('_')[2])
+        result, multiplier = game.open_cell(cell)
+        
+        if result == 'mine':
+            user = init_user(user_id)
+            user['games_played'] += 1
+            user['lost_total'] += game.bet
+            add_to_admin(game.bet)
+            data = load_data()
+            data[user_id] = user
+            save_data(data)
+            
+            bot.edit_message_text(
+                f"{game.get_grid_display()}\n\n💥 *ВЗРЫВ!* Потеряно: -{game.bet} Dcoin\n💰 Баланс: {user['balance']} Dcoin",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown'
+            )
+            del active_mines_games[user_id]
+        
+        elif result == 'win':
+            win = game.cash_out()
+            user = init_user(user_id)
+            user['balance'] += win
+            user['games_played'] += 1
+            user['games_won'] += 1
+            user['turnover'] += win
+            dmp_earned = int(win * 0.02)
+            user['dmp'] += dmp_earned
+            data = load_data()
+            data[user_id] = user
+            save_data(data)
+            
+            bot.edit_message_text(
+                f"{game.get_grid_display()}\n\n"
+                f"🏆 *ПОЛНАЯ ПОБЕДА!* 🏆\n"
+                f"💰 Выигрыш: +{win} Dcoin\n"
+                f"📈 Множитель: x{game.multiplier:.2f}\n"
+                f"🎖️ DMP: +{dmp_earned}\n"
+                f"💵 Баланс: {user['balance']} Dcoin",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown'
+            )
+            del active_mines_games[user_id]
+        
+        elif result == 'safe':
+            show_mines_field(call.message, game)
+        else:
+            bot.answer_callback_query(call.id, "Эта клетка уже открыта!", show_alert=True)
+
+# =========== ИГРА КРАШ (ИСПРАВЛЕННАЯ) ===========
+def get_crash_multiplier():
+    r = random.random()
+    if r < 0.0001:
+        return round(random.uniform(1000, 100000), 2)
+    elif r < 0.001:
+        return round(random.uniform(100, 1000), 2)
+    elif r < 0.01:
+        return round(random.uniform(10, 100), 2)
+    elif r < 0.1:
+        return round(random.uniform(5, 10), 2)
+    else:
+        return round(random.uniform(1.01, 5), 2)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'game_crash')
+def crash_game_menu(call):
+    user = init_user(call.from_user.id)
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton('✈️ 100', callback_data='crash_100'),
+        types.InlineKeyboardButton('✈️ 500', callback_data='crash_500'),
+        types.InlineKeyboardButton('✈️ 1000', callback_data='crash_1000'),
+        types.InlineKeyboardButton('✈️ Все', callback_data='crash_all'),
+        types.InlineKeyboardButton('❌ Назад', callback_data='back_to_games')
+    )
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"✈️ *ИГРА КРАШ*\n\n"
+             f"📊 Шансы выпадения:\n"
+             f"• x1.01-5: 89% 📉\n"
+             f"• x5-10: 10% 📈\n"
+             f"• x10-100: 1% 💰\n"
+             f"• x100-1000: 0.1% 💎\n"
+             f"• x1000+: 0.01% 🚀\n\n"
+             f"💰 Баланс: *{user['balance']} Dcoin*",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('crash_') and not call.data.startswith('crash_take'))
+def crash_game_callback(call):
+    user_id = str(call.from_user.id)
+    user = init_user(user_id)
+    
+    if call.data == 'crash_all':
+        bet = user['balance']
+    else:
+        bet = int(call.data.split('_')[1])
+    
+    if bet <= 0 or bet > user['balance']:
+        bot.answer_callback_query(call.id, "❌ Недостаточно средств!", show_alert=True)
+        return
+    
+    # Списываем ставку
+    user['balance'] -= bet
+    user['turnover'] += bet
+    user['games_played'] += 1
+    
+    data = load_data()
+    data[user_id] = user
+    save_data(data)
+    
+    crash_point = get_crash_multiplier()
+    
+    # Сохраняем игру с уникальным ID
+    game_id = f"{user_id}_{int(time.time())}"
+    active_crash_games[game_id] = {
+        'user_id': user_id,
+        'bet': bet,
+        'crash_point': crash_point,
+        'current_multiplier': 1.0,
+        'active': True,
+        'message_id': call.message.message_id,
+        'chat_id': call.message.chat.id
+    }
+    
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton('💰 Забрать', callback_data=f'crash_take_{game_id}'))
+    
+    msg = bot.edit_message_text(
+        f"✈️ *Краш взлетает...*\n\n"
+        f"💰 Ставка: {bet} Dcoin\n"
+        f"📈 Текущий: x1.00",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+    
+    def animate_crash():
+        current = 1.0
+        step = 0.05
+        
+        for i in range(100):
+            if game_id not in active_crash_games or not active_crash_games[game_id]['active']:
+                break
+                
+            if current >= crash_point:
+                try:
+                    # Проверяем, не забрали ли уже
+                    if game_id in active_crash_games and active_crash_games[game_id]['active']:
+                        bot.edit_message_text(
+                            f"✈️ *КРАШ!*\n\n"
+                            f"💰 Ставка: {bet} Dcoin\n"
+                            f"💥 Краш на: x{crash_point}\n"
+                            f"❌ *ПРОИГРЫШ*\n"
+                            f"💸 Потеряно: -{bet} Dcoin",
+                            chat_id=call.message.chat.id,
+                            message_id=call.message.message_id,
+                            parse_mode='Markdown'
+                        )
+                        user = init_user(user_id)
+                        user['lost_total'] += bet
+                        add_to_admin(bet)
+                        data = load_data()
+                        data[user_id] = user
+                        save_data(data)
+                        
+                        if game_id in active_crash_games:
+                            del active_crash_games[game_id]
+                except Exception as e:
+                    print(f"Ошибка при краше: {e}")
+                break
+            
+            if i % 2 == 0:
+                try:
+                    if game_id in active_crash_games and active_crash_games[game_id]['active']:
+                        active_crash_games[game_id]['current_multiplier'] = current
+                        bot.edit_message_text(
+                            f"✈️ *Краш летит...*\n\n"
+                            f"💰 Ставка: {bet} Dcoin\n"
+                            f"📈 Текущий: x{current:.2f}",
+                            chat_id=call.message.chat.id,
+                            message_id=call.message.message_id,
+                            reply_markup=markup,
+                            parse_mode='Markdown'
+                        )
+                except Exception as e:
+                    print(f"Ошибка при обновлении: {e}")
+                    break
+            
+            current += step * random.uniform(0.8, 1.2)
+            time.sleep(0.1)
+    
+    thread = threading.Thread(target=animate_crash)
+    thread.daemon = True
+    thread.start()
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('crash_take_'))
+def crash_take(call):
+    try:
+        game_id = call.data.replace('crash_take_', '')
+        
+        if game_id not in active_crash_games:
+            bot.answer_callback_query(call.id, "❌ Игра не найдена или уже завершена!", show_alert=True)
+            return
+        
+        game = active_crash_games[game_id]
+        
+        if not game['active']:
+            bot.answer_callback_query(call.id, "❌ Игра уже завершена!", show_alert=True)
+            return
+        
+        # Помечаем игру как неактивную
+        game['active'] = False
+        
+        user_id = game['user_id']
+        bet = game['bet']
+        current_multi = game['current_multiplier']
+        
+        win = int(bet * current_multi)
+        
+        user = init_user(user_id)
+        user['balance'] += win
+        user['games_won'] += 1
+        user['turnover'] += win
+        
+        if win > bet * 10:
+            user['dmp'] += int(win * 0.01)
+        
+        data = load_data()
+        data[user_id] = user
+        save_data(data)
+        
+        try:
+            bot.edit_message_text(
+                f"✈️ *ВЫ ЗАБРАЛИ!*\n\n"
+                f"💰 Ставка: {bet} Dcoin\n"
+                f"📈 Множитель: x{current_multi:.2f}\n"
+                f"💵 Выигрыш: +{win} Dcoin\n"
+                f"💥 Краш был бы на: x{game['crash_point']}\n\n"
+                f"💰 Баланс: {user['balance']} Dcoin",
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode='Markdown'
+            )
+        except Exception as e:
+            print(f"Ошибка при редактировании сообщения: {e}")
+            bot.send_message(
+                call.message.chat.id,
+                f"✈️ *ВЫ ЗАБРАЛИ!*\n\n"
+                f"💰 Ставка: {bet} Dcoin\n"
+                f"📈 Множитель: x{current_multi:.2f}\n"
+                f"💵 Выигрыш: +{win} Dcoin\n"
+                f"💰 Баланс: {user['balance']} Dcoin",
+                parse_mode='Markdown'
+            )
+        
+        # Удаляем игру
+        del active_crash_games[game_id]
+        
+        bot.answer_callback_query(call.id, "✅ Вы забрали выигрыш!")
+        
+    except Exception as e:
+        print(f"Ошибка в crash_take: {e}")
+        bot.answer_callback_query(call.id, f"❌ Ошибка: {e}", show_alert=True)
+
+# =========== ТЕКСТОВАЯ КОМАНДА ДЛЯ КРАШ ===========
+@bot.message_handler(func=lambda message: message.text.lower().startswith('краш '))
+@subscription_required
+@ban_required
+def crash_text(message):
+    try:
+        parts = message.text.lower().split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ Формат: `краш 500`", parse_mode='Markdown')
+            return
+        bet = parse_amount(parts[1])
+        if not bet or bet < 100:
+            bot.send_message(message.chat.id, "❌ Минимальная ставка: 100 Dcoin")
+            return
+        user = init_user(message.from_user.id)
+        if user['balance'] < bet:
+            bot.send_message(message.chat.id, "❌ Недостаточно средств")
+            return
+        
+        # Создаем фиктивный call объект
+        fake_call = type('obj', (object,), {
+            'id': 'fake',
+            'from_user': message.from_user,
+            'message': message,
+            'data': f'crash_{bet}'
+        })
+        crash_game_callback(fake_call)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+# =========== ПРОФИЛЬ С ОБОРОТОМ И DMP ===========
+@bot.message_handler(func=lambda message: message.text in ['👤 Профиль', '/profile'])
+@subscription_required
+@ban_required
+def profile_command(message):
+    user = init_user(message.from_user.id)
+    update_user_info(message.from_user.id, message)
+    win_rate = calculate_win_rate(user)
+    profile_text = (
+        f"👤 *Профиль:* {message.from_user.first_name}\n"
+        f"🆔 ID: `{message.from_user.id}`\n"
+        f"💰 *Баланс:* {user['balance']} Dcoin\n"
+        f"📊 *Оборот:* {user.get('turnover', 0)} Dcoin\n"
+        f"🎖️ *DMP (DODO POINT):* {user.get('dmp', 0)}\n"
+        f"📉 *Проиграно:* {user['lost_total']} Dcoin\n"
+        f"🎮 *Игр:* {user['games_played']}\n"
+        f"✅ *Побед:* {user['games_won']}\n"
+        f"📊 *Win rate:* {win_rate}%\n"
+        f"👥 *Рефералов:* {user.get('referrals', 0)}\n"
+        f"🎁 *Реф. бонус:* {user.get('referral_bonus', 0)} Dcoin\n"
+        f"🏆 *Уровень:* {user['balance'] // 1000 + 1}"
+    )
+    bot.send_message(message.chat.id, profile_text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['balance'])
+def balance_command(message):
+    user = init_user(message.from_user.id)
+    bot.send_message(message.chat.id, f"💰 Ваш баланс: {user['balance']} Dcoin")
+
+# =========== ПЕРЕВОДЫ ЧЕРЕЗ ОТВЕТ НА СООБЩЕНИЕ ===========
+@bot.message_handler(func=lambda message: message.reply_to_message is not None and 
+                    (message.text.lower().startswith('дать') or 
+                     message.text.lower().startswith('перевести') or 
+                     message.text.lower().startswith('накинуть') or 
+                     message.text.lower().startswith('/give')))
+@subscription_required
+@ban_required
+def transfer_reply(message):
+    try:
+        text = message.text.strip()
+        if text.lower().startswith('/give'):
+            text = text[5:].strip()
+        else:
+            parts = text.split()
+            if len(parts) >= 2:
+                text = ' '.join(parts[1:])
+        
+        amount = parse_amount(text)
+        if not amount or amount < 100:
+            bot.send_message(message.chat.id, "❌ Минимальная сумма перевода: 100 Dcoin")
+            return
+        
+        sender = init_user(message.from_user.id)
+        if sender['balance'] < amount:
+            bot.send_message(message.chat.id, "❌ Недостаточно средств")
+            return
+        
+        target_user = message.reply_to_message.from_user
+        if target_user.id == message.from_user.id:
+            bot.send_message(message.chat.id, "❌ Нельзя переводить самому себе")
+            return
+        
+        target = init_user(target_user.id)
+        
+        sender['balance'] -= amount
+        target['balance'] += amount
+        
+        data = load_data()
+        data[str(message.from_user.id)] = sender
+        data[str(target_user.id)] = target
+        save_data(data)
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ *Перевод выполнен!*\n\n"
+            f"Получатель: {target_user.first_name}\n"
+            f"Сумма: *{amount} Dcoin*\n"
+            f"Ваш баланс: {sender['balance']} Dcoin",
+            parse_mode='Markdown'
+        )
+        
+        try:
+            bot.send_message(
+                target_user.id,
+                f"💰 *Вам перевели Dcoin!*\n"
+                f"От: {message.from_user.first_name}\n"
+                f"Сумма: +{amount} Dcoin\n"
+                f"Баланс: {target['balance']} Dcoin",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
+            
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+# =========== ПРОМОКОДЫ (АДМИН) ===========
+@bot.message_handler(commands=['admin'])
+def admin_command(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        bot.send_message(message.chat.id, "❌ У вас нет прав администратора")
+        return
+    
+    markup = types.ReplyKeyboardMarkup(resize_keyboard=True, row_width=2)
+    markup.add('📊 Статистика', '💰 Баланс админа', '👥 Список игроков')
+    markup.add('🔄 Обнулить балансы', '🎫 Управление промо', '🚫 Бан система')
+    markup.add('💳 Изменить баланс', '👮 Блокировка', '🎮 Вернуться')
+    
+    bot.send_message(
+        message.chat.id,
+        "👑 *АДМИН ПАНЕЛЬ*\nВыберите действие:",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.message_handler(func=lambda message: message.text == '🎫 Управление промо')
+def admin_promo_menu(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton('➕ Создать промо', callback_data='admin_promo_create'),
+        types.InlineKeyboardButton('📋 Список промо', callback_data='admin_promo_list'),
+        types.InlineKeyboardButton('❌ Удалить промо', callback_data='admin_promo_delete'),
+        types.InlineKeyboardButton('🔙 Назад', callback_data='admin_back')
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        "🎫 *УПРАВЛЕНИЕ ПРОМОКОДАМИ*",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_promo_create')
+def admin_promo_create(call):
+    bot.edit_message_text(
+        "➕ *СОЗДАНИЕ ПРОМОКОДА*\n\n"
+        "Введите в формате:\n"
+        "`ПРОМОКОД СУММА КОЛ-ВО_АКТИВАЦИЙ`\n\n"
+        "Пример: `BONUS2024 5000 100`",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(call.message, process_promo_create)
+
+def process_promo_create(message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 3:
+            bot.send_message(message.chat.id, "❌ Неверный формат!")
+            return
+        code = parts[0].upper()
+        amount = int(parts[1])
+        uses = int(parts[2])
+        promos = load_promocodes()
+        promos[code] = {
+            'amount': amount,
+            'uses_left': uses,
+            'created_by': ADMIN_ID,
+            'created_at': datetime.now().isoformat()
+        }
+        save_promocodes(promos)
+        bot.send_message(
+            message.chat.id,
+            f"✅ *Промокод создан!*\n\n"
+            f"🎫 Код: `{code}`\n"
+            f"💰 Сумма: {amount} Dcoin\n"
+            f"📊 Активаций: {uses}",
+            parse_mode='Markdown'
+        )
+        admin_promo_menu(message)
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_promo_list')
+def admin_promo_list(call):
+    promos = load_promocodes()
+    if not promos:
+        bot.edit_message_text(
+            "📋 *Нет активных промокодов*",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+        return
+    text = "📋 *АКТИВНЫЕ ПРОМОКОДЫ:*\n\n"
+    for code, data in promos.items():
+        text += f"🎫 `{code}`\n"
+        text += f"💰 {data['amount']} Dcoin\n"
+        text += f"📊 Осталось: {data['uses_left']}\n"
+        text += f"📅 Создан: {data['created_at'][:10]}\n\n"
+    bot.edit_message_text(
+        text,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_promo_delete')
+def admin_promo_delete(call):
+    promos = load_promocodes()
+    if not promos:
+        bot.edit_message_text(
+            "❌ *Нет промокодов для удаления*",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+        return
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    for code in promos.keys():
+        markup.add(types.InlineKeyboardButton(f'❌ {code}', callback_data=f'delete_promo_{code}'))
+    markup.add(types.InlineKeyboardButton('🔙 Назад', callback_data='admin_back'))
+    bot.edit_message_text(
+        "🎫 *Выберите промокод для удаления:*",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('delete_promo_'))
+def delete_promo(call):
+    code = call.data.replace('delete_promo_', '')
+    promos = load_promocodes()
+    if code in promos:
+        del promos[code]
+        save_promocodes(promos)
+        bot.answer_callback_query(call.id, f"✅ Промокод {code} удален!", show_alert=True)
+    admin_promo_delete(call)
+
+# =========== ПРОМОКОДЫ ДЛЯ ПОЛЬЗОВАТЕЛЕЙ ===========
+@bot.message_handler(func=lambda message: message.text == '💎 Промокод')
+@subscription_required
+@ban_required
+def promocode(message):
+    bot.send_message(
+        message.chat.id,
+        "💎 *Введите промокод:*\n\nПример: `DODO2024`",
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(message, process_promocode)
+
+def process_promocode(message):
+    user = init_user(message.from_user.id)
+    code = message.text.strip().upper()
+    
+    if 'used_promos' not in user:
+        user['used_promos'] = []
+    if code in user['used_promos']:
+        bot.send_message(message.chat.id, "❌ *Вы уже активировали этот промокод!*", parse_mode='Markdown')
+        return
+    
+    promos = load_promocodes()
+    if code in promos and promos[code]['uses_left'] > 0:
+        bonus = promos[code]['amount']
+        user['balance'] += bonus
+        user['used_promos'].append(code)
+        promos[code]['uses_left'] -= 1
+        if promos[code]['uses_left'] <= 0:
+            del promos[code]
+        save_promocodes(promos)
+        data = load_data()
+        data[str(message.from_user.id)] = user
+        save_data(data)
+        bot.send_message(
+            message.chat.id,
+            f"✅ *Промокод активирован!*\n"
+            f"💰 Вы получили: *+{bonus} Dcoin*\n"
+            f"💵 Баланс: *{user['balance']} Dcoin*",
+            parse_mode='Markdown'
+        )
+    else:
+        bot.send_message(message.chat.id, "❌ *Недействительный или использованный промокод!*", parse_mode='Markdown')
+
+# =========== ИГРЫ: КУБИК, СЛОТЫ, МЕНЮ ===========
+@bot.message_handler(func=lambda message: message.text == '🎮 Игры')
+@subscription_required
+@ban_required
+def games_menu(message):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton('🎲 Кубик', callback_data='game_dice'),
+        types.InlineKeyboardButton('🎰 Слоты', callback_data='game_slots'),
+        types.InlineKeyboardButton('💣 Мины', callback_data='game_mines'),
+        types.InlineKeyboardButton('✈️ Краш', callback_data='game_crash'),
+        types.InlineKeyboardButton('❌ Закрыть', callback_data='close_menu')
+    )
+    bot.send_message(message.chat.id, "🎮 *ВЫБЕРИТЕ ИГРУ:*", reply_markup=markup, parse_mode='Markdown')
+
+@bot.callback_query_handler(func=lambda call: call.data == 'game_mines')
+def game_mines_callback(call):
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    start_mines(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'game_dice')
+def dice_game_menu(call):
+    user = init_user(call.from_user.id)
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        types.InlineKeyboardButton('🎲 100 на 6', callback_data='dice_100_6'),
+        types.InlineKeyboardButton('🎲 500 на 6', callback_data='dice_500_6'),
+        types.InlineKeyboardButton('🎲 1000 на 6', callback_data='dice_1000_6'),
+        types.InlineKeyboardButton('🎲 Все на 6', callback_data='dice_all_6'),
+        types.InlineKeyboardButton('❌ Назад', callback_data='back_to_games')
+    )
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"🎲 *ИГРА В КУБИКИ*\n\n"
+             f"Бот кидает 2 кубика\n"
+             f"Если выпадает ваше число - x2.6\n\n"
+             f"💰 Баланс: *{user['balance']} Dcoin*",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('dice_'))
+def dice_game(call):
+    user_id = str(call.from_user.id)
+    user = init_user(user_id)
+    
+    if call.data == 'dice_all_6':
+        bet = user['balance']
+        number = 6
+    else:
+        parts = call.data.split('_')
+        bet = int(parts[1])
+        number = int(parts[2])
+    
+    if bet <= 0 or bet > user['balance']:
+        bot.answer_callback_query(call.id, "❌ Недостаточно средств!", show_alert=True)
+        return
+    
+    user['balance'] -= bet
+    user['games_played'] += 1
+    user['turnover'] += bet
+    
+    bot.edit_message_text(
+        "🎲 *Бросаем кубики...* 🎲",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+    
+    time.sleep(1)
+    
+    dice1 = random.randint(1, 6)
+    dice2 = random.randint(1, 6)
+    
+    result_text = f"🎲 *КУБИКИ:* {dice1} и {dice2}\n"
+    result_text += f"🎯 Ваше число: {number}\n\n"
+    
+    if dice1 == number or dice2 == number:
+        win = int(bet * 2.6)
+        user['balance'] += win
+        user['games_won'] += 1
+        user['turnover'] += win
+        result_text += f"✅ *ПОБЕДА!* 🎉\n"
+        result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+    else:
+        add_to_admin(bet)
+        user['lost_total'] += bet
+        result_text += f"❌ *ПРОИГРЫШ*\n"
+        result_text += f"💸 Потеряно: *-{bet} Dcoin*\n"
+    
+    result_text += f"\n💵 Баланс: *{user['balance']} Dcoin*"
+    
+    data = load_data()
+    data[user_id] = user
+    save_data(data)
+    
+    bot.edit_message_text(
+        result_text,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'game_slots')
+def slots_game_menu(call):
+    user = init_user(call.from_user.id)
+    markup = types.InlineKeyboardMarkup(row_width=3)
+    markup.add(
+        types.InlineKeyboardButton('🎰 100', callback_data='slots_100'),
+        types.InlineKeyboardButton('🎰 500', callback_data='slots_500'),
+        types.InlineKeyboardButton('🎰 1000', callback_data='slots_1000'),
+        types.InlineKeyboardButton('🎰 Все', callback_data='slots_all'),
+        types.InlineKeyboardButton('❌ Назад', callback_data='back_to_games')
+    )
+    bot.edit_message_text(
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        text=f"🎰 *ИГРОВЫЕ АВТОМАТЫ*\n\n"
+             f"Три 7️⃣ = x777\n"
+             f"Три одинаковых = x10\n"
+             f"Два одинаковых = x1.5\n\n"
+             f"💰 Баланс: *{user['balance']} Dcoin*",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data.startswith('slots_'))
+def slots_game(call):
+    user_id = str(call.from_user.id)
+    user = init_user(user_id)
+    
+    if call.data == 'slots_all':
+        bet = user['balance']
+    else:
+        bet = int(call.data.split('_')[1])
+    
+    if bet <= 0 or bet > user['balance']:
+        bot.answer_callback_query(call.id, "❌ Недостаточно средств!", show_alert=True)
+        return
+    
+    user['balance'] -= bet
+    user['games_played'] += 1
+    user['turnover'] += bet
+    
+    symbols = ['🍒', '🍋', '🍊', '🍉', '⭐', '🔔', '7️⃣']
+    
+    for i in range(3):
+        time.sleep(0.3)
+        rand_sym = [random.choice(symbols) for _ in range(3)]
+        bot.edit_message_text(
+            f"🎰 *Крутим слоты...*\n{rand_sym[0]} | {rand_sym[1]} | {rand_sym[2]}",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+    
+    time.sleep(0.5)
+    
+    slot1 = random.choice(symbols)
+    slot2 = random.choice(symbols)
+    slot3 = random.choice(symbols)
+    
+    result_text = f"🎰 *СЛОТЫ:* {slot1} | {slot2} | {slot3}\n\n"
+    
+    if slot1 == slot2 == slot3 == '7️⃣':
+        win = bet * 777
+        user['balance'] += win
+        user['games_won'] += 1
+        user['turnover'] += win
+        result_text += f"🎉 *ДЖЕКПОТ 777!* 💎\n"
+        result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+    elif slot1 == slot2 == slot3:
+        win = bet * 10
+        user['balance'] += win
+        user['games_won'] += 1
+        user['turnover'] += win
+        result_text += f"✅ *ТРИ ОДИНАКОВЫХ!*\n"
+        result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+    elif slot1 == slot2 or slot2 == slot3 or slot1 == slot3:
+        win = int(bet * 1.5)
+        user['balance'] += win
+        user['games_won'] += 1
+        user['turnover'] += win
+        result_text += f"👍 *ДВА ОДИНАКОВЫХ*\n"
+        result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+    else:
+        add_to_admin(bet)
+        user['lost_total'] += bet
+        result_text += f"❌ *ПРОИГРЫШ*\n"
+        result_text += f"💸 Потеряно: *-{bet} Dcoin*\n"
+    
+    result_text += f"\n💵 Баланс: *{user['balance']} Dcoin*"
+    
+    data = load_data()
+    data[user_id] = user
+    save_data(data)
+    
+    bot.edit_message_text(
+        result_text,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'back_to_games')
+def back_to_games(call):
+    games_menu(call.message)
+
+@bot.callback_query_handler(func=lambda call: call.data == 'close_menu')
+def close_menu(call):
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+
+# =========== ТЕКСТОВЫЕ КОМАНДЫ ДЛЯ ИГР ===========
+@bot.message_handler(func=lambda message: message.text.lower().startswith('кубик '))
+@subscription_required
+@ban_required
+def dice_text(message):
+    try:
+        parts = message.text.lower().split()
+        if len(parts) != 3:
+            bot.send_message(message.chat.id, "❌ Формат: `кубик 500 6`", parse_mode='Markdown')
+            return
+        
+        bet = parse_amount(parts[1])
+        number = int(parts[2])
+        
+        if not bet or bet < 100:
+            bot.send_message(message.chat.id, "❌ Минимальная ставка: 100 Dcoin")
+            return
+        if number < 1 or number > 6:
+            bot.send_message(message.chat.id, "❌ Число от 1 до 6")
+            return
+        
+        user = init_user(message.from_user.id)
+        if user['balance'] < bet:
+            bot.send_message(message.chat.id, "❌ Недостаточно средств")
+            return
+        
+        user['balance'] -= bet
+        user['games_played'] += 1
+        user['turnover'] += bet
+        
+        dice1 = random.randint(1, 6)
+        dice2 = random.randint(1, 6)
+        
+        result_text = f"🎲 *КУБИКИ:* {dice1} и {dice2}\n"
+        result_text += f"🎯 Ваше число: {number}\n\n"
+        
+        if dice1 == number or dice2 == number:
+            win = int(bet * 2.6)
+            user['balance'] += win
+            user['games_won'] += 1
+            user['turnover'] += win
+            result_text += f"✅ *ПОБЕДА!* 🎉\n"
+            result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+        else:
+            add_to_admin(bet)
+            user['lost_total'] += bet
+            result_text += f"❌ *ПРОИГРЫШ*\n"
+            result_text += f"💸 Потеряно: *-{bet} Dcoin*\n"
+        
+        result_text += f"\n💵 Баланс: *{user['balance']} Dcoin*"
+        
+        data = load_data()
+        data[str(message.from_user.id)] = user
+        save_data(data)
+        
+        bot.send_message(message.chat.id, result_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, "❌ Ошибка. Формат: `кубик 500 6`", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text.lower().startswith('слоты '))
+@subscription_required
+@ban_required
+def slots_text(message):
+    try:
+        parts = message.text.lower().split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ Формат: `слоты 500`", parse_mode='Markdown')
+            return
+        
+        bet = parse_amount(parts[1])
+        if not bet or bet < 100:
+            bot.send_message(message.chat.id, "❌ Минимальная ставка: 100 Dcoin")
+            return
+        
+        user = init_user(message.from_user.id)
+        if user['balance'] < bet:
+            bot.send_message(message.chat.id, "❌ Недостаточно средств")
+            return
+        
+        user['balance'] -= bet
+        user['games_played'] += 1
+        user['turnover'] += bet
+        
+        symbols = ['🍒', '🍋', '🍊', '🍉', '⭐', '🔔', '7️⃣']
+        slot1 = random.choice(symbols)
+        slot2 = random.choice(symbols)
+        slot3 = random.choice(symbols)
+        
+        result_text = f"🎰 *СЛОТЫ:* {slot1} | {slot2} | {slot3}\n\n"
+        
+        if slot1 == slot2 == slot3 == '7️⃣':
+            win = bet * 777
+            user['balance'] += win
+            user['games_won'] += 1
+            user['turnover'] += win
+            result_text += f"🎉 *ДЖЕКПОТ 777!* 💎\n"
+            result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+        elif slot1 == slot2 == slot3:
+            win = bet * 10
+            user['balance'] += win
+            user['games_won'] += 1
+            user['turnover'] += win
+            result_text += f"✅ *ТРИ ОДИНАКОВЫХ!*\n"
+            result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+        elif slot1 == slot2 or slot2 == slot3 or slot1 == slot3:
+            win = int(bet * 1.5)
+            user['balance'] += win
+            user['games_won'] += 1
+            user['turnover'] += win
+            result_text += f"👍 *ДВА ОДИНАКОВЫХ*\n"
+            result_text += f"💰 Выигрыш: *+{win} Dcoin*\n"
+        else:
+            add_to_admin(bet)
+            user['lost_total'] += bet
+            result_text += f"❌ *ПРОИГРЫШ*\n"
+            result_text += f"💸 Потеряно: *-{bet} Dcoin*\n"
+        
+        result_text += f"\n💵 Баланс: *{user['balance']} Dcoin*"
+        
+        data = load_data()
+        data[str(message.from_user.id)] = user
+        save_data(data)
+        
+        bot.send_message(message.chat.id, result_text, parse_mode='Markdown')
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, "❌ Ошибка. Формат: `слоты 500`", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text.lower().startswith('мины '))
+@subscription_required
+@ban_required
+def mines_text(message):
+    try:
+        parts = message.text.lower().split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ Формат: `мины 500`", parse_mode='Markdown')
+            return
+        
+        bet = parse_amount(parts[1])
+        if not bet or bet < 100:
+            bot.send_message(message.chat.id, "❌ Минимальная ставка: 100 Dcoin")
+            return
+        
+        user = init_user(message.from_user.id)
+        if user['balance'] < bet:
+            bot.send_message(message.chat.id, "❌ Недостаточно средств")
+            return
+        
+        # Переходим к вводу количества мин
+        ctx = get_user_context(message.from_user.id)
+        ctx['mines_bet'] = bet
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ Ставка принята: {bet} Dcoin\n\n"
+            "💣 Введите количество мин (1-6):"
+        )
+        bot.register_next_step_handler(message, process_mines_count)
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+# =========== БОНУС, ОГРАБЛЕНИЕ, РЕФЕРАЛЫ, ТОП ===========
+@bot.message_handler(func=lambda message: message.text == '🎁 Бонус')
+@subscription_required
+@ban_required
+def bonus(message):
+    user = init_user(message.from_user.id)
+    now = datetime.now()
+    
+    if user['last_bonus']:
+        last_bonus = datetime.fromisoformat(user['last_bonus'])
+        if now - last_bonus < timedelta(hours=24):
+            time_left = timedelta(hours=24) - (now - last_bonus)
+            hours = int(time_left.seconds // 3600)
+            minutes = int((time_left.seconds % 3600) // 60)
+            bot.send_message(message.chat.id, f"⏳ Бонус через {hours}ч {minutes}м")
+            return
+    
+    bonus_amount = random.randint(100, 10000)
+    user['balance'] += bonus_amount
+    user['last_bonus'] = now.isoformat()
+    
+    data = load_data()
+    data[str(message.from_user.id)] = user
+    save_data(data)
+    
+    bot.send_message(message.chat.id, f"🎁 *Бонус:* +{bonus_amount} Dcoin\n💰 *Баланс:* {user['balance']} Dcoin", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '💰 Ограбить')
+@subscription_required
+@ban_required
+def rob(message):
+    user = init_user(message.from_user.id)
+    now = datetime.now()
+    
+    if user['last_robbery']:
+        last_robbery = datetime.fromisoformat(user['last_robbery'])
+        if now - last_robbery < timedelta(hours=24):
+            time_left = timedelta(hours=24) - (now - last_robbery)
+            hours = int(time_left.seconds // 3600)
+            minutes = int((time_left.seconds % 3600) // 60)
+            bot.send_message(message.chat.id, f"⏳ Ограбить через {hours}ч {minutes}м")
+            return
+    
+    robbery = random.randint(1000, 100000)
+    user['balance'] += robbery
+    user['last_robbery'] = now.isoformat()
+    
+    data = load_data()
+    data[str(message.from_user.id)] = user
+    save_data(data)
+    
+    bot.send_message(message.chat.id, f"💰 *Ограблено:* +{robbery} Dcoin\n💰 *Баланс:* {user['balance']} Dcoin", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '👥 Рефералы')
+@subscription_required
+@ban_required
+def referrals(message):
+    user_id = str(message.from_user.id)
+    user = init_user(user_id)
+    
+    ref_link = f"https://t.me/{bot.get_me().username}?start={user_id}"
+    
+    ref_text = (
+        f"👥 *Реферальная программа*\n\n"
+        f"📊 *Ваши рефералы:* {user.get('referrals', 0)}\n"
+        f"💰 *Заработано:* {user.get('referral_bonus', 0)} Dcoin\n\n"
+        f"🎁 *Бонусы:*\n"
+        f"• За приглашение друга: +500 Dcoin\n"
+        f"• Другу за регистрацию: +300 Dcoin\n\n"
+        f"🔗 *Ваша ссылка:*\n`{ref_link}`"
+    )
+    
+    bot.send_message(message.chat.id, ref_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '🏆 Топ игроков')
+@subscription_required
+@ban_required
+def top_players(message):
+    data = load_data()
+    players = []
+    
+    for user_id, user_data in data.items():
+        if user_id != str(ADMIN_ID):
+            name = user_data.get('first_name') or user_data.get('username') or f'Игрок {user_id[:5]}'
+            balance = user_data['balance']
+            players.append((name, balance))
+    
+    players.sort(key=lambda x: x[1], reverse=True)
+    
+    if not players:
+        bot.send_message(message.chat.id, "🏆 Топ игроков пока пуст")
+        return
+    
+    top_text = "🏆 *ТОП 10 ИГРОКОВ*\n\n"
+    for i, (name, balance) in enumerate(players[:10], 1):
+        medal = "🥇" if i == 1 else "🥈" if i == 2 else "🥉" if i == 3 else f"{i}."
+        top_text += f"{medal} {name} - *{balance} Dcoin*\n"
+    
+    bot.send_message(message.chat.id, top_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '💸 Перевод')
+@subscription_required
+@ban_required
+def transfer_menu(message):
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton('💸 Дать', callback_data='transfer_give'),
+        types.InlineKeyboardButton('❌ Отмена', callback_data='close_menu')
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        "💸 *Перевод средств*\n\n"
+        "Чтобы перевести деньги, ответьте на сообщение пользователя командой:\n"
+        "`дать 1000` или `/give 1000`",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+# =========== АДМИН СТАТИСТИКА, БАН, БАЛАНС ===========
+@bot.message_handler(func=lambda message: message.text == '📊 Статистика')
+def admin_stats(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    data = load_data()
+    total_players = len([uid for uid in data if uid != str(ADMIN_ID)])
+    total_balance = sum(user['balance'] for uid, user in data.items() if uid != str(ADMIN_ID))
+    total_games = sum(user['games_played'] for uid, user in data.items() if uid != str(ADMIN_ID))
+    total_wins = sum(user['games_won'] for uid, user in data.items() if uid != str(ADMIN_ID))
+    
+    admin_balance = data.get(str(ADMIN_ID), {}).get('balance', 0)
+    banned = load_banned()
+    
+    stats_text = (
+        f"📊 *СТАТИСТИКА БОТА*\n\n"
+        f"👥 Активных игроков: *{total_players}*\n"
+        f"🚫 Забанено: *{len(banned)}*\n"
+        f"💰 Общий баланс: *{total_balance} Dcoin*\n"
+        f"🏦 Баланс казны: *{admin_balance} Dcoin*\n"
+        f"🎮 Всего игр: *{total_games}*\n"
+        f"✅ Всего побед: *{total_wins}*\n"
+        f"📈 Win rate: *{round(total_wins/total_games*100, 1) if total_games > 0 else 0}%*"
+    )
+    
+    bot.send_message(message.chat.id, stats_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '💰 Баланс админа')
+def admin_balance_command(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    admin_user = init_user(ADMIN_ID)
+    bot.send_message(message.chat.id, f"🏦 *Баланс казны:* {admin_user['balance']} Dcoin", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '👥 Список игроков')
+def admin_players(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    data = load_data()
+    players = []
+    
+    for user_id, user_data in data.items():
+        if user_id != str(ADMIN_ID):
+            name = user_data.get('first_name') or user_data.get('username') or f'Игрок {user_id[:5]}'
+            balance = user_data['balance']
+            games = user_data['games_played']
+            players.append((name, balance, games, user_id))
+    
+    if not players:
+        bot.send_message(message.chat.id, "👥 Нет зарегистрированных игроков")
+        return
+    
+    players.sort(key=lambda x: x[1], reverse=True)
+    
+    players_text = "👥 *ТОП 20 ИГРОКОВ:*\n\n"
+    for i, (name, balance, games, user_id) in enumerate(players[:20], 1):
+        players_text += f"{i}. {name} - *{balance} Dcoin* (🎮 {games})\n"
+    
+    bot.send_message(message.chat.id, players_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '🔄 Обнулить балансы')
+def admin_reset(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    data = load_data()
+    for user_id in data:
+        if user_id != str(ADMIN_ID):
+            data[user_id]['balance'] = INITIAL_BALANCE
+            data[user_id]['lost_total'] = 0
+    
+    save_data(data)
+    bot.send_message(message.chat.id, "✅ *Балансы всех игроков обнулены!*", parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '💳 Изменить баланс')
+def admin_change_balance(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    bot.send_message(
+        message.chat.id,
+        "💳 *ИЗМЕНЕНИЕ БАЛАНСА*\n\n"
+        "Введите в формате:\n"
+        "`ID СУММА`\n\n"
+        "Пример: `123456789 5000`\n"
+        "Для вычитания: `123456789 -1000`",
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(message, process_balance_change)
+
+def process_balance_change(message):
+    try:
+        parts = message.text.split()
+        if len(parts) != 2:
+            bot.send_message(message.chat.id, "❌ Неверный формат!")
+            return
+        
+        user_id = parts[0]
+        amount = int(parts[1])
+        
+        data = load_data()
+        if user_id not in data:
+            data[user_id] = init_user(user_id)
+        
+        old_balance = data[user_id]['balance']
+        data[user_id]['balance'] += amount
+        
+        save_data(data)
+        
+        try:
+            if amount > 0:
+                bot.send_message(
+                    user_id,
+                    f"💰 *Вам начислено {amount} Dcoin!*\n"
+                    f"💵 Новый баланс: {data[user_id]['balance']} Dcoin",
+                    parse_mode='Markdown'
+                )
+            else:
+                bot.send_message(
+                    user_id,
+                    f"💸 *Списание {abs(amount)} Dcoin*\n"
+                    f"💵 Новый баланс: {data[user_id]['balance']} Dcoin",
+                    parse_mode='Markdown'
+                )
+        except:
+            pass
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ *Баланс изменен!*\n\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"💰 Было: {old_balance} Dcoin\n"
+            f"💳 Изменение: {amount:+} Dcoin\n"
+            f"💵 Стало: {data[user_id]['balance']} Dcoin",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.message_handler(func=lambda message: message.text == '🚫 Бан система' or message.text == '👮 Блокировка')
+def admin_ban_menu(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton('🔨 Забанить', callback_data='admin_ban'),
+        types.InlineKeyboardButton('🔓 Разбанить', callback_data='admin_unban'),
+        types.InlineKeyboardButton('📋 Список банов', callback_data='admin_ban_list'),
+        types.InlineKeyboardButton('🔙 Назад', callback_data='admin_back')
+    )
+    
+    bot.send_message(
+        message.chat.id,
+        "🚫 *БАН СИСТЕМА*",
+        reply_markup=markup,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_ban')
+def admin_ban(call):
+    bot.edit_message_text(
+        "🔨 *БЛОКИРОВКА ПОЛЬЗОВАТЕЛЯ*\n\n"
+        "Введите в формате:\n"
+        "`/ban ID ДНИ ПРИЧИНА`\n\n"
+        "Пример: `/ban 123456789 30 Мошенничество`",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+
+@bot.message_handler(commands=['ban'])
+def ban_user(message):
+    if str(message.from_user.id) != str(ADMIN_ID):
+        return
+    
+    try:
+        parts = message.text.split()
+        if len(parts) < 4:
+            bot.send_message(message.chat.id, "❌ Формат: `/ban ID ДНИ ПРИЧИНА`", parse_mode='Markdown')
+            return
+        
+        user_id = parts[1]
+        days = int(parts[2])
+        reason = ' '.join(parts[3:])
+        
+        banned = load_banned()
+        ban_until = datetime.now() + timedelta(days=days)
+        
+        banned[user_id] = {
+            'until': ban_until.isoformat(),
+            'reason': reason,
+            'banned_by': ADMIN_ID,
+            'banned_at': datetime.now().isoformat()
+        }
+        save_banned(banned)
+        
+        try:
+            bot.send_message(
+                user_id,
+                f"🚫 *Вы заблокированы!*\n\n"
+                f"📅 До: {ban_until.strftime('%d.%m.%Y %H:%M')}\n"
+                f"⏳ Дней: {days}\n"
+                f"📝 Причина: {reason}",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ *Пользователь заблокирован!*\n\n"
+            f"🆔 ID: `{user_id}`\n"
+            f"⏳ Срок: {days} дней\n"
+            f"📝 Причина: {reason}",
+            parse_mode='Markdown'
+        )
+        
+    except Exception as e:
+        bot.send_message(message.chat.id, f"❌ Ошибка: {e}")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_unban')
+def admin_unban(call):
+    bot.edit_message_text(
+        "🔓 *РАЗБЛОКИРОВКА*\n\n"
+        "Введите ID пользователя:\n"
+        "Пример: `123456789`",
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+    bot.register_next_step_handler(call.message, process_unban)
+
+def process_unban(message):
+    user_id = message.text.strip()
+    banned = load_banned()
+    
+    if user_id in banned:
+        del banned[user_id]
+        save_banned(banned)
+        
+        try:
+            bot.send_message(
+                user_id,
+                f"🔓 *Вы разблокированы!*\n\n"
+                f"Вы снова можете пользоваться ботом.",
+                parse_mode='Markdown'
+            )
+        except:
+            pass
+        
+        bot.send_message(
+            message.chat.id,
+            f"✅ *Пользователь {user_id} разблокирован!*",
+            parse_mode='Markdown'
+        )
+    else:
+        bot.send_message(message.chat.id, "❌ Пользователь не найден в списке банов")
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_ban_list')
+def admin_ban_list(call):
+    banned = load_banned()
+    
+    if not banned:
+        bot.edit_message_text(
+            "📋 *Список банов пуст*",
+            chat_id=call.message.chat.id,
+            message_id=call.message.message_id,
+            parse_mode='Markdown'
+        )
+        return
+    
+    text = "🚫 *ЗАБЛОКИРОВАННЫЕ ПОЛЬЗОВАТЕЛИ:*\n\n"
+    for user_id, ban_info in banned.items():
+        ban_until = datetime.fromisoformat(ban_info['until'])
+        days_left = (ban_until - datetime.now()).days
+        text += f"🆔 `{user_id}`\n"
+        text += f"📅 До: {ban_until.strftime('%d.%m.%Y')}\n"
+        text += f"⏳ Осталось: {days_left} дн.\n"
+        text += f"📝 Причина: {ban_info.get('reason', 'Не указана')}\n\n"
+    
+    bot.edit_message_text(
+        text,
+        chat_id=call.message.chat.id,
+        message_id=call.message.message_id,
+        parse_mode='Markdown'
+    )
+
+@bot.callback_query_handler(func=lambda call: call.data == 'admin_back')
+def admin_back(call):
+    bot.delete_message(call.message.chat.id, call.message.message_id)
+    admin_command(call.message)
+
+@bot.message_handler(func=lambda message: message.text == '❓ Помощь')
+@subscription_required
+@ban_required
+def help_command(message):
+    help_text = (
+        "❓ *Помощь по Dodo Coin*\n\n"
+        "*🎮 ИГРЫ:*\n"
+        "• Кубик - угадай число, x2.6\n"
+        "• Слоты - три 7️⃣ = x777\n"
+        "• Мины - найди сокровище\n"
+        "• Краш - успей забрать\n\n"
+        "*💰 ЗАРАБОТОК:*\n"
+        "• 🎁 Бонус - раз в 24ч\n"
+        "• 💰 Ограбить - раз в 24ч\n"
+        "• 👥 Рефералы - +500 за друга\n\n"
+        "*📝 КОМАНДЫ:*\n"
+        "• /start - главное меню\n"
+        "• /profile - профиль\n"
+        "• /mines - игра Мины\n"
+        "• `дать 1000` (ответом) - перевод\n"
+        "• `кубик 1000 6` - ставка 1000 на 6\n"
+        "• `слоты 500` - слоты 500\n"
+        "• `краш 1000` - игра краш\n"
+        "• `мины 100` - игра мины\n\n"
+        "*💎 ПРОМОКОДЫ:*\n"
+        "• Вводите в меню '💎 Промокод'"
+    )
+    
+    bot.send_message(message.chat.id, help_text, parse_mode='Markdown')
+
+@bot.message_handler(func=lambda message: message.text == '🎮 Вернуться')
+def back_to_main(message):
+    start(message)
+
+# =========== ЗАПУСК БОТА ===========
+if __name__ == '__main__':
+    print("=" * 60)
+    print("🚀 ЗАПУСК БОТА DODO COIN (ФИНАЛЬНАЯ ВЕРСИЯ)")
+    print("=" * 60)
+    print(f"✅ Токен: {TOKEN[:10]}...")
+    print(f"👑 Админ ID: {ADMIN_ID}")
+    print(f"💰 Начальный баланс: {INITIAL_BALANCE}")
+    print(f"📢 Подписки: ОТКЛЮЧЕНЫ")
+    print(f"💾 Файл данных: {DATA_FILE}")
+    print("=" * 60)
+    print("🤖 Бот запущен и готов к работе!")
+    print("📝 Для остановки нажмите Ctrl+C")
+    print("=" * 60)
+    
+    while True:
+        try:
+            bot.polling(none_stop=True, interval=0, timeout=20)
+        except Exception as e:
+            print(f"❌ Ошибка: {e}")
+            print("🔄 Перезапуск через 5 секунд...")
+            time.sleep(5)
